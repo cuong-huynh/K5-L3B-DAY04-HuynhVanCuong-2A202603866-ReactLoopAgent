@@ -1,27 +1,55 @@
-"""Bốn provider cùng một interface. Không chứa agent loop."""
+"""Provider adapters cùng một interface. Không chứa agent loop."""
 import json
 import os
+import uuid
 import urllib.error
 import urllib.request
+
+DEFAULT_OPENCODE_ENDPOINT = 'https://opencode.ai/inference/go/openai/v1'
+
+DEFAULT_NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1'
 
 CONFIG = {
     'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
     'gemini': ('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'),
     'openrouter': ('OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
+    # OpenAI-compatible: key=API_KEY, URL từ API_ENDPOINT (+ /chat/completions).
+    'opencode': ('API_KEY', None),
+    # NVIDIA NIM / integrate.api.nvidia.com
+    'nvidia': ('NVIDIA_API_KEY', None),
 }
 
 
-def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+def chat_completions_url(endpoint):
+    base = (endpoint or DEFAULT_OPENCODE_ENDPOINT).rstrip('/')
+    if base.endswith('/chat/completions'):
+        return base
+    return f'{base}/chat/completions'
+
+
+def post_json(url, headers, payload, timeout=180, retries=4):
+    raw = json.dumps(payload).encode()
+    last_exc = None
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=raw, headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors='replace')[:240]
+            last_exc = RuntimeError(
+                f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota. {body}'
+            )
+            # Free-tier Gemini often returns 429/503; wait and retry a few times.
+            if exc.code in (429, 503) and attempt + 1 < retries:
+                import time
+                time.sleep(20 * (attempt + 1))
+                continue
+            raise last_exc from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    raise last_exc
 
 
 class Provider:
@@ -33,13 +61,29 @@ class Provider:
     def __init__(self, name, model):
         if name not in CONFIG:
             raise ValueError(f'Provider không hợp lệ: {name}')
+        if name in ('opencode', 'nvidia') and not model:
+            model = os.getenv('API_MODEL') or os.getenv('MODEL')
         if not model:
-            raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
+            raise ValueError('Cần đặt MODEL (hoặc API_MODEL) là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
-        key_name, self.url = CONFIG[name]
-        self.key = os.getenv(key_name)
+        key_name, url = CONFIG[name]
+        if name == 'opencode':
+            self.url = chat_completions_url(os.getenv('API_ENDPOINT'))
+        elif name == 'nvidia':
+            self.url = chat_completions_url(os.getenv('NVIDIA_BASE_URL') or DEFAULT_NVIDIA_ENDPOINT)
+        else:
+            self.url = url
+        self.key = os.getenv(key_name) or (os.getenv('API_KEY') if name == 'nvidia' else None)
         if not self.key:
-            raise ValueError(f'Thiếu {key_name}; xem README.md.')
+            raise ValueError(f'Thiếu {key_name}; xem README.md / .env.example.')
+        # Go lane requires a stable session id per conversation for routing/cache.
+        self.session = os.getenv('OPENCODE_SESSION') or f'ses_{uuid.uuid4().hex}'
+
+    def _headers(self):
+        headers = {'Authorization': f'Bearer {self.key}', 'User-Agent': 'StatusAgentLab/1.0'}
+        if self.name == 'opencode':
+            headers['x-opencode-session'] = self.session
+        return headers
 
     def complete(self, messages, schemas):
         if self.name == 'anthropic':
@@ -47,10 +91,20 @@ class Provider:
         payload = {'model': self.model, 'messages': messages}
         if schemas:
             payload['tools'] = schemas
-        data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
+        # Lab agent loop needs non-streaming tool calls; keep NVIDIA extras off by default.
+        if self.name == 'nvidia':
+            payload.setdefault('temperature', float(os.getenv('NVIDIA_TEMPERATURE', '0.2')))
+            payload.setdefault('top_p', float(os.getenv('NVIDIA_TOP_P', '0.95')))
+            payload.setdefault('max_tokens', int(os.getenv('NVIDIA_MAX_TOKENS', '2048')))
+        data = post_json(self.url, self._headers(), payload)
         choice = data['choices'][0]
         message = choice['message']
-        calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in message.get('tool_calls', [])]
+        calls = []
+        for c in message.get('tool_calls') or []:
+            fn = c.get('function') or {}
+            call_id = c.get('id') or f'call_{uuid.uuid4().hex[:12]}'
+            c['id'] = call_id
+            calls.append({'id': call_id, 'name': fn.get('name'), 'arguments': fn.get('arguments') or '{}'})
         return {'message': message, 'calls': calls, 'finish': choice.get('finish_reason'), 'usage': data.get('usage', {})}
 
     def _anthropic(self, messages, schemas):

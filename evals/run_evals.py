@@ -33,11 +33,11 @@ def run_case(case, args):
 
 def main():
     parser = argparse.ArgumentParser(description='Chạy agent và chấm eval 0–100')
-    choices = ['openai', 'gemini', 'anthropic', 'openrouter']
+    choices = ['openai', 'gemini', 'anthropic', 'openrouter', 'opencode', 'nvidia']
     parser.add_argument('--provider', choices=choices, default=os.getenv('PROVIDER', 'openai'))
-    parser.add_argument('--model', default=os.getenv('MODEL'))
+    parser.add_argument('--model', default=os.getenv('MODEL') or os.getenv('API_MODEL'))
     parser.add_argument('--judge-provider', choices=choices, default=os.getenv('JUDGE_PROVIDER'))
-    parser.add_argument('--judge-model', default=os.getenv('JUDGE_MODEL'))
+    parser.add_argument('--judge-model', default=os.getenv('JUDGE_MODEL') or os.getenv('API_MODEL'))
     parser.add_argument('--bonus', action='store_true', help='Chạy bộ bonus riêng; không ảnh hưởng điểm chính')
     parser.add_argument('--case', help='Ví dụ E2 hoặc H1; bỏ trống để chạy toàn bộ')
     parser.add_argument('--max-steps', type=int, default=None, help='Giới hạn model calls mỗi case: mặc định 8, bonus 16')
