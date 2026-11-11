@@ -49,3 +49,9 @@ Cùng cấu hình: provider/model/judge/`max_steps=8`/dataset core.
 - Điểm LLM judge có thể lệch hoặc phụ thuộc model; cần đối chiếu `expected` và evidence trong trace.
 - Snapshot status cố định theo ngày lưu fixture, không phản ánh tình trạng thật hiện tại.
 - Chỉ một lần eval mỗi phiên bản agent nên chưa đo được phương sai giữa các lần chạy.
+
+## 6. Bonus (tùy chọn)
+
+- Kết nối `tools.schemas` / `tools.system_prompt`; trả `RATE_LIMITED`/`INVALID_ARGUMENTS` về model; chờ `Retry-After` khi 429 thật (giới hạn ngắn); không coi 429 là outage; pagination qua `next_offset`.
+- `eval_bonus.json`: 10/10 scored, điểm bộ **99.5/100** → `bonus_points_0_15 = 14.92`.
+- Case thấp nhất: B2 = 95 (pagination timeline Vercel).
